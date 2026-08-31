@@ -1,0 +1,17 @@
+{
+  "name": "abc2soundbox",
+  "version": "0.1.0",
+  "description": "Convert ABC music notation into SoundBox song arrays",
+  "type": "module",
+  "license": "MIT",
+  "author": "fdoganis",
+  "repository": "github:fdoganis/abc2soundbox",
+  "scripts": {
+    "serve": "http-server . -c-1 -o",
+    "smoke": "node smoke.mjs"
+  },
+  "devDependencies": {
+    "abcjs": "^6.7.0",
+    "http-server": "^14.1.1"
+  }
+}
