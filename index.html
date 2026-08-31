@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>abc2soundbox</title>
+    <script src="https://cdn.jsdelivr.net/npm/abcjs@6/dist/abcjs-basic-min.js"></script>
+    <style>
+      body {
+        font: 14px/1.5 system-ui, sans-serif;
+        margin: 0;
+        padding: 1.2rem;
+        max-width: 60rem;
+        color: #1b1b1b;
+        background: #fafafa;
+      }
+      h1 {
+        font-size: 1.1rem;
+        margin: 0 0 0.8rem;
+      }
+      textarea {
+        width: 100%;
+        box-sizing: border-box;
+        font: 12px/1.4 ui-monospace, monospace;
+        padding: 0.6rem;
+      }
+      #abc {
+        height: 9rem;
+      }
+      #out {
+        height: 12rem;
+      }
+      .row {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 0.6rem;
+        align-items: center;
+        margin: 0.7rem 0;
+      }
+      button {
+        padding: 0.4rem 0.9rem;
+        font-size: 13px;
+        cursor: pointer;
+      }
+      label {
+        display: inline-flex;
+        gap: 0.3rem;
+        align-items: center;
+      }
+      input[type="number"] {
+        width: 4rem;
+      }
+      #meta {
+        white-space: pre-wrap;
+        background: #f0f0f0;
+        padding: 0.6rem;
+        font: 12px/1.4 ui-monospace, monospace;
+        border-left: 3px solid #bbb;
+      }
+      #meta.err {
+        border-color: #c33;
+        color: #c33;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>abc → SoundBox</h1>
+
+    <textarea id="abc">
+X:1
+T:scale + chords
+M:4/4
+L:1/8
+K:C
+CDEF GABc | [CEG]4 [CFA]4 | cBAG FEDC | C8 |]</textarea
+    >
+
+    <div class="row">
+      <label>rows/beat <input id="rpb" type="number" min="1" max="16" placeholder="auto" /></label>
+      <label>octave <input id="oct" type="number" value="0" min="-4" max="4" /></label>
+      <button id="convert">Convert</button>
+      <button id="play">Play</button>
+      <button id="stop">Stop</button>
+      <button id="copy">Copy song</button>
+    </div>
+
+    <div id="meta"></div>
+    <textarea id="out" readonly></textarea>
+
+    <script type="module">
+      import { abcToSong } from "./src/convert.js";
+      import { playSong } from "./src/play.js";
+
+      const $ = (id) => document.getElementById(id);
+      let current = null;
+      let handle = null;
+
+      function convert() {
+        try {
+          const rpb = parseInt($("rpb").value, 10);
+          const res = abcToSong($("abc").value, {
+            rowsPerBeat: Number.isFinite(rpb) ? rpb : undefined,
+            octaveShift: parseInt($("oct").value, 10) || 0,
+          });
+          current = res.song;
+          $("out").value = "var song = " + JSON.stringify(res.song) + ";";
+          $("meta").className = "";
+          $("meta").textContent = JSON.stringify(res.meta, null, 2);
+        } catch (e) {
+          current = null;
+          $("meta").className = "err";
+          $("meta").textContent = "ERROR: " + e.message;
+        }
+      }
+
+      $("convert").onclick = convert;
+      $("stop").onclick = () => {
+        if (handle) handle.stop();
+        handle = null;
+      };
+      $("play").onclick = async () => {
+        convert();
+        if (!current) return;
+        if (handle) handle.stop();
+        handle = await playSong(current);
+      };
+      $("copy").onclick = () => navigator.clipboard.writeText($("out").value);
+
+      convert();
+    </script>
+  </body>
+</html>
