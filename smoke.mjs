@@ -94,6 +94,37 @@ ok(
   );
 }
 
+// Transpose: V: transpose= and %%MIDI transpose shift a melodic voice.
+{
+  const a = abcToSong(`X:1\nL:1/4\nK:C\nV:1 transpose=-12\nC2 z2 |`).song;
+  ok(a.songData[0].c[0].n[0] === 123, "V: transpose=-12 shifts C4 (135) down to 123");
+  const b = abcToSong(`X:1\nL:1/4\n%%MIDI transpose 7\nK:C\nC2 z2 |`).song;
+  ok(b.songData[0].c[0].n[0] === 142, "%%MIDI transpose 7 shifts C4 (135) up to 142");
+}
+
+// Repeats: |: :| plays the section twice; identical bars share one c entry.
+{
+  const { song: r } = abcToSong(`X:1\nM:4/4\nL:1/4\nK:C\n|: CDEF :|`);
+  ok(r.endPattern === 1, "|: CDEF :| spans two pattern slots");
+  ok(r.songData[0].c.length === 1, "the two identical bars share one c entry");
+  ok(JSON.stringify(r.songData[0].p) === "[1,1]", "p references pattern 1 twice");
+}
+
+// 1st/2nd endings: |: CD |1 EF :|2 GA | -> C D E F, then C D G A.
+{
+  const { song: e } = abcToSong(`X:1\nM:4/4\nL:1/4\nK:C\n|: CD |1 EF :|2 GA |`);
+  const bar0 = e.songData[0].c[e.songData[0].p[0] - 1].n; // successive notes = successive rows
+  const bar1 = e.songData[0].c[e.songData[0].p[1] - 1].n;
+  ok(
+    JSON.stringify(bar0.slice(0, 4)) === "[135,137,139,140]",
+    "first pass bar holds C D E F",
+  );
+  ok(
+    JSON.stringify(bar1.slice(0, 4)) === "[135,137,142,144]",
+    "second pass bar holds C D G A (ending 1 skipped)",
+  );
+}
+
 // A %%MIDI channel 10 voice routes each drum note to its own percussion track.
 {
   const { song: s3, meta: m3 } = abcToSong(
