@@ -1,9 +1,12 @@
 // ABC -> SoundBox song object. v1 slice: melodic voices only.
 //
-// A chord packs into a track's four note-columns (SoundBox reads
-// c[p].n[row + col*patternLen] for col 0..3, so one track is 4-voice
-// polyphonic per row). Drum routing, pattern de-duplication and the sidecar
-// instrument map arrive in later passes.
+// One ABC voice -> one or more SoundBox tracks. A chord fills a track's four
+// note-columns (SoundBox reads c[p].n[row + col*patternLen] for col 0..3);
+// chords past four notes fan out to extra tracks sharing the instrument.
+// `%%MIDI program N` on a voice (or the tune) selects a GM family patch.
+// A `%%MIDI channel 10` voice is a drum voice: each note's GM number (from the
+// abcjs drummap, else its pitch) routes to a percussion patch, one track per
+// distinct drum. Repeat handling arrives in a later pass.
 //
 // Note length is NOT encoded: an onset is placed on the grid and the following
 // rows are left empty. How long the note sounds is the instrument envelope.
@@ -13,11 +16,21 @@
 // denominators, so every onset lands exactly on a row. A manual rowsPerBeat
 // override forces a coarser grid at the cost of quantization.
 
-import { KIT } from "./kit.js";
+import {
+  MELODIC,
+  DEFAULT_MELODIC,
+  melodicForProgram,
+  PERCUSSION,
+  percForNote,
+} from "./kit.js";
 
 // SoundBox note n = MIDI + 75. The synth plays 0.003959503758 * 2^((n-128)/12) Hz,
 // so n = 128 is F3 (MIDI 53), giving the constant offset below.
 const SB_OFFSET = 75;
+
+// Drums play at the SoundBox reference note; each percussion patch's OSC1_SEMI
+// carries its own tuning, so the written drum pitch never reaches the oscillator.
+const DRUM_NOTE = 128;
 
 const STEP_SEMI = [0, 2, 4, 5, 7, 9, 11]; // semitone of C D E F G A B within the octave
 const ACC_SEMI = { sharp: 1, flat: -1, natural: 0, dblsharp: 2, dblflat: -2 };
@@ -100,6 +113,22 @@ function keyAccidentals(staff) {
   return out;
 }
 
+// Turn a patternIdx -> n-array map into a SoundBox track { i, p, c }.
+function buildTrack(instr, cByPattern) {
+  const maxP = Math.max(...cByPattern.keys());
+  const p = [];
+  const c = [];
+  for (let pi = 0; pi <= maxP; pi++) {
+    if (cByPattern.has(pi)) {
+      c.push({ n: cByPattern.get(pi), f: [] });
+      p.push(c.length);
+    } else {
+      p.push(0);
+    }
+  }
+  return { i: instr.slice(), p, c };
+}
+
 export function abcToSong(abc, cfg = {}) {
   const octaveShift = cfg.octaveShift || 0;
   const warnings = [];
@@ -117,6 +146,17 @@ export function abcToSong(abc, cfg = {}) {
     }
   }
 
+  // `%%MIDI program` given before any V: applies to every voice as a default.
+  const tuneMidi = (tune.formatting && tune.formatting.midi) || {};
+  const midiProgram = (params) =>
+    params && params.length ? (params.length >= 2 ? params[1] : params[0]) : null;
+  const tuneProgram = midiProgram(tuneMidi.program);
+
+  // `%%MIDI drummap <noteName> <gmNote>` -> GM percussion number, resolved here
+  // rather than relying on abcjs to fold it into note.midipitch. Seeded from the
+  // tune-level map; per-voice drummap directives overlay it below.
+  const drummap = { ...(tuneMidi.drummap || {}) };
+
   // Pass 1: note events per voice, keyed "staffIdx:voiceIdx", plus every duration.
   const voices = new Map();
   const durations = new Set([meter.num / meter.den]); // the bar length is on the grid too
@@ -127,22 +167,34 @@ export function abcToSong(abc, cfg = {}) {
       (staff.voices || []).forEach((items, vi) => {
         const key = si + ":" + vi;
         let v = voices.get(key);
-        if (!v) voices.set(key, (v = { events: [], pos: 0 }));
+        if (!v) voices.set(key, (v = { events: [], pos: 0, program: tuneProgram, drum: false }));
         let barState = {};
         for (const it of items) {
           if (it.el_type === "bar") {
             barState = {};
             continue;
           }
+          if (it.el_type === "midi") {
+            if (it.cmd === "program") v.program = midiProgram(it.params);
+            else if (it.cmd === "channel" && it.params && it.params[0] === 10) v.drum = true;
+            else if (it.cmd === "drummap" && it.params && it.params.length >= 2) {
+              drummap[it.params[0]] = +it.params[1];
+            }
+            continue;
+          }
           if (it.el_type !== "note") continue;
           const dur = it.duration || 0;
           if (dur > 0) durations.add(dur);
           if (!it.rest && it.pitches && it.pitches.length) {
-            const midis = it.pitches.map(
-              (p) =>
-                pitchToMidi(p.pitch, p.accidental, keyAcc, barState) + 12 * octaveShift,
-            );
-            v.events.push({ pos: v.pos, midis });
+            const midis = [];
+            const gms = []; // drum-routing GM number: drummap by note name, else midipitch/pitch
+            for (const p of it.pitches) {
+              const base = pitchToMidi(p.pitch, p.accidental, keyAcc, barState);
+              midis.push(base + 12 * octaveShift);
+              const mapped = drummap[p.name];
+              gms.push(mapped != null ? mapped : p.midipitch != null ? p.midipitch : base);
+            }
+            v.events.push({ pos: v.pos, midis, gms });
           }
           v.pos += dur;
         }
@@ -171,44 +223,63 @@ export function abcToSong(abc, cfg = {}) {
     );
   }
 
-  // Pass 2: place events into one track per voice.
+  // Pass 2: place each voice into one track, or several when a chord exceeds the
+  // four note-columns (extra tracks share the instrument).
   const songData = [];
   let endPattern = 0;
-  const fallback = (cfg.instruments && cfg.instruments.melodic) || KIT.pad;
+  const voiceMap = {};
 
   for (const [key, v] of voices) {
     if (!v.events.length) continue;
-    const cByPattern = new Map(); // patternIdx -> n array (length patternLen*4)
+
+    if (v.drum) {
+      // One track per distinct GM percussion patch. The written pitch only
+      // selected the drum; it then plays at the patch's own tuning.
+      const lanes = new Map(); // patch name -> (patternIdx -> n array)
+      for (const ev of v.events) {
+        const row = Math.round(ev.pos * rowsPerWhole);
+        const pIdx = Math.floor(row / patternLen);
+        const rIdx = row % patternLen;
+        if (pIdx > endPattern) endPattern = pIdx;
+        for (const gm of ev.gms) {
+          const patch = percForNote(gm);
+          let lane = lanes.get(patch);
+          if (!lane) lanes.set(patch, (lane = new Map()));
+          let n = lane.get(pIdx);
+          if (!n) lane.set(pIdx, (n = new Array(patternLen * 4).fill(0)));
+          n[rIdx] = DRUM_NOTE;
+        }
+      }
+      voiceMap[key] = `drums: ${[...lanes.keys()].join(", ")}`;
+      for (const [patch, lane] of lanes) songData.push(buildTrack(PERCUSSION[patch], lane));
+      continue;
+    }
+
+    const name = v.program != null ? melodicForProgram(v.program) : DEFAULT_MELODIC;
+    voiceMap[key] = v.program != null ? `${name} (prog ${v.program})` : name;
+    const instrument = MELODIC[name];
+
+    const maxChord = v.events.reduce((m, e) => Math.max(m, e.midis.length), 1);
+    const subMaps = Array.from({ length: Math.ceil(maxChord / 4) }, () => new Map());
 
     for (const ev of v.events) {
       const row = Math.round(ev.pos * rowsPerWhole);
       const pIdx = Math.floor(row / patternLen);
       const rIdx = row % patternLen;
       if (pIdx > endPattern) endPattern = pIdx;
-      let n = cByPattern.get(pIdx);
-      if (!n) cByPattern.set(pIdx, (n = new Array(patternLen * 4).fill(0)));
-      if (ev.midis.length > 4) {
-        warnings.push(`chord of ${ev.midis.length} truncated to 4 (voice ${key})`);
-      }
-      ev.midis.slice(0, 4).forEach((m, col) => {
-        const idx = rIdx + col * patternLen;
+      ev.midis.forEach((m, k) => {
+        const sub = subMaps[Math.floor(k / 4)];
+        let n = sub.get(pIdx);
+        if (!n) sub.set(pIdx, (n = new Array(patternLen * 4).fill(0)));
+        const idx = rIdx + (k % 4) * patternLen;
         if (n[idx]) warnings.push(`note collision at pattern ${pIdx} row ${rIdx} (grid too coarse)`);
         n[idx] = m + SB_OFFSET;
       });
     }
 
-    const maxP = Math.max(...cByPattern.keys());
-    const p = [];
-    const c = [];
-    for (let pi = 0; pi <= maxP; pi++) {
-      if (cByPattern.has(pi)) {
-        c.push({ n: cByPattern.get(pi), f: [] });
-        p.push(c.length);
-      } else {
-        p.push(0);
-      }
+    for (const cByPattern of subMaps) {
+      if (cByPattern.size) songData.push(buildTrack(instrument, cByPattern));
     }
-    songData.push({ i: fallback.slice(), p, c });
   }
 
   if (!songData.length) throw new Error("no playable notes");
@@ -224,6 +295,7 @@ export function abcToSong(abc, cfg = {}) {
       patternLen,
       endPattern,
       tracks: songData.length,
+      voiceMap,
       warnings: [...new Set(warnings)],
     },
   };
