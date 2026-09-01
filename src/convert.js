@@ -6,7 +6,9 @@
 // `%%MIDI program N` on a voice (or the tune) selects a GM family patch.
 // A `%%MIDI channel 10` voice is a drum voice: each note's GM number (from the
 // abcjs drummap, else its pitch) routes to a percussion patch, one track per
-// distinct drum. Repeat handling arrives in a later pass.
+// distinct drum. `|: :|` repeats and 1st/2nd endings are expanded into the
+// played order; identical bars then share one pattern. `V: transpose=` and
+// `%%MIDI transpose` shift a melodic voice's pitch (drums are unaffected).
 //
 // Note length is NOT encoded: an onset is placed on the grid and the following
 // rows are left empty. How long the note sounds is the instrument envelope.
@@ -113,20 +115,83 @@ function keyAccidentals(staff) {
   return out;
 }
 
-// Turn a patternIdx -> n-array map into a SoundBox track { i, p, c }.
+// Turn a patternIdx -> n-array map into a SoundBox track { i, p, c }. Bars with
+// identical note content share one c entry (repeated sections collapse for free).
 function buildTrack(instr, cByPattern) {
   const maxP = Math.max(...cByPattern.keys());
+  const seen = new Map(); // n-array key -> 1-based c index
   const p = [];
   const c = [];
   for (let pi = 0; pi <= maxP; pi++) {
-    if (cByPattern.has(pi)) {
-      c.push({ n: cByPattern.get(pi), f: [] });
-      p.push(c.length);
-    } else {
+    const n = cByPattern.get(pi);
+    if (!n) {
       p.push(0);
+      continue;
     }
+    const nkey = n.join(",");
+    let idx = seen.get(nkey);
+    if (!idx) {
+      c.push({ n, f: [] });
+      idx = c.length;
+      seen.set(nkey, idx);
+    }
+    p.push(idx);
   }
   return { i: instr.slice(), p, c };
+}
+
+const isBar = (it) => it && it.el_type === "bar";
+const isRepeatClose = (it) =>
+  isBar(it) && (it.type === "bar_right_repeat" || it.type === "bar_dbl_repeat");
+const isRepeatOpen = (it) =>
+  isBar(it) && (it.type === "bar_left_repeat" || it.type === "bar_dbl_repeat");
+
+// Expand one level of |: :| with optional |1 |2 endings into the played item
+// order. First pass plays the low ending then repeats; second pass skips it and
+// plays the higher ending. Nested / multi-repeat structures are approximated
+// with a warning.
+function linearizeVoice(items, warnings, key) {
+  const out = [];
+  let sectionStart = 0;
+  let repeatDone = false;
+  let opens = 0;
+  let guard = items.length * 4 + 32;
+
+  for (let i = 0; i < items.length && guard-- > 0; ) {
+    const it = items[i];
+
+    if (isRepeatClose(it) && !repeatDone) {
+      out.push(it);
+      repeatDone = true;
+      for (let j = sectionStart, skip = false, g = items.length * 2 + 16; j < i && g-- > 0; j++) {
+        const jt = items[j];
+        if (isBar(jt) && jt.startEnding) skip = jt.startEnding === "1";
+        if (!skip) out.push(jt);
+      }
+      if (it.type === "bar_dbl_repeat") {
+        sectionStart = i + 1;
+        repeatDone = false;
+      }
+      i++;
+      continue;
+    }
+
+    if (isRepeatOpen(it)) {
+      if (opens++ > 0 && !repeatDone) {
+        warnings.push(`voice ${key}: nested/multiple repeats — playback approximate`);
+      }
+      out.push(it);
+      sectionStart = i + 1;
+      repeatDone = false;
+      i++;
+      continue;
+    }
+
+    out.push(it);
+    i++;
+  }
+  if (guard <= 0) warnings.push(`voice ${key}: repeat expansion hit its guard limit`);
+  return out;
 }
 
 export function abcToSong(abc, cfg = {}) {
@@ -156,50 +221,75 @@ export function abcToSong(abc, cfg = {}) {
   // rather than relying on abcjs to fold it into note.midipitch. Seeded from the
   // tune-level map; per-voice drummap directives overlay it below.
   const drummap = { ...(tuneMidi.drummap || {}) };
+  const tuneTranspose = (tuneMidi.transpose && +tuneMidi.transpose[0]) || 0;
 
-  // Pass 1: note events per voice, keyed "staffIdx:voiceIdx", plus every duration.
-  const voices = new Map();
-  const durations = new Set([meter.num / meter.den]); // the bar length is on the grid too
+  // Pass 1a: gather each voice's items across all lines, plus its clef transpose,
+  // with a synthetic marker carrying the key signature in force at each line.
+  const rawVoices = new Map();
   for (const line of tune.lines || []) {
     if (!line.staff) continue;
     line.staff.forEach((staff, si) => {
       const keyAcc = keyAccidentals(staff);
+      const clefTranspose = (staff.clef && staff.clef.transpose) || 0;
       (staff.voices || []).forEach((items, vi) => {
         const key = si + ":" + vi;
-        let v = voices.get(key);
-        if (!v) voices.set(key, (v = { events: [], pos: 0, program: tuneProgram, drum: false }));
-        let barState = {};
-        for (const it of items) {
-          if (it.el_type === "bar") {
-            barState = {};
-            continue;
-          }
-          if (it.el_type === "midi") {
-            if (it.cmd === "program") v.program = midiProgram(it.params);
-            else if (it.cmd === "channel" && it.params && it.params[0] === 10) v.drum = true;
-            else if (it.cmd === "drummap" && it.params && it.params.length >= 2) {
-              drummap[it.params[0]] = +it.params[1];
-            }
-            continue;
-          }
-          if (it.el_type !== "note") continue;
-          const dur = it.duration || 0;
-          if (dur > 0) durations.add(dur);
-          if (!it.rest && it.pitches && it.pitches.length) {
-            const midis = [];
-            const gms = []; // drum-routing GM number: drummap by note name, else midipitch/pitch
-            for (const p of it.pitches) {
-              const base = pitchToMidi(p.pitch, p.accidental, keyAcc, barState);
-              midis.push(base + 12 * octaveShift);
-              const mapped = drummap[p.name];
-              gms.push(mapped != null ? mapped : p.midipitch != null ? p.midipitch : base);
-            }
-            v.events.push({ pos: v.pos, midis, gms });
-          }
-          v.pos += dur;
-        }
+        let rv = rawVoices.get(key);
+        if (!rv) rawVoices.set(key, (rv = { items: [], clefTranspose }));
+        rv.items.push({ el_type: "_key", keyAcc }, ...items);
       });
     });
+  }
+
+  // Pass 1b: expand repeats, then walk each voice into positioned note events.
+  const voices = new Map();
+  const durations = new Set([meter.num / meter.den]); // the bar length is on the grid too
+  for (const [key, rv] of rawVoices) {
+    const items = linearizeVoice(rv.items, warnings, key);
+    const v = {
+      events: [],
+      pos: 0,
+      program: tuneProgram,
+      drum: false,
+      transpose: rv.clefTranspose + tuneTranspose,
+    };
+    voices.set(key, v);
+    let barState = {};
+    let keyAcc = {};
+    for (const it of items) {
+      if (it.el_type === "_key") {
+        keyAcc = it.keyAcc;
+        continue;
+      }
+      if (it.el_type === "bar") {
+        barState = {};
+        continue;
+      }
+      if (it.el_type === "midi") {
+        if (it.cmd === "program") v.program = midiProgram(it.params);
+        else if (it.cmd === "channel" && it.params && it.params[0] === 10) v.drum = true;
+        else if (it.cmd === "drummap" && it.params && it.params.length >= 2) {
+          drummap[it.params[0]] = +it.params[1];
+        } else if (it.cmd === "transpose" && it.params && it.params.length) {
+          v.transpose = rv.clefTranspose + tuneTranspose + (+it.params[0] || 0);
+        }
+        continue;
+      }
+      if (it.el_type !== "note") continue;
+      const dur = it.duration || 0;
+      if (dur > 0) durations.add(dur);
+      if (!it.rest && it.pitches && it.pitches.length) {
+        const midis = [];
+        const gms = []; // drum-routing GM number: drummap by note name, else midipitch/pitch
+        for (const p of it.pitches) {
+          const base = pitchToMidi(p.pitch, p.accidental, keyAcc, barState);
+          midis.push(base + 12 * octaveShift + v.transpose);
+          const mapped = drummap[p.name];
+          gms.push(mapped != null ? mapped : p.midipitch != null ? p.midipitch : base);
+        }
+        v.events.push({ pos: v.pos, midis, gms });
+      }
+      v.pos += dur;
+    }
   }
 
   // Derive the row grid, or honor a manual override.
