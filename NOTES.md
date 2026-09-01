@@ -93,9 +93,25 @@ effect). Refine by ear later.
   written pitch only selected the drum.
 - `meta.voiceMap[key]` = `"drums: kick, snare, hatClosed"`.
 
+## Step 4 — repeats, endings, bar de-dup, transpose
+
+- `linearizeVoice(items)` expands one level of `|: :|` plus `|1 |2` endings into
+  the played item order (first pass plays the low ending then repeats; second
+  pass skips it). Nested / multi-repeat -> warning + best effort.
+- Voice items are now gathered across all lines first (Pass 1a) then linearized
+  (Pass 1b); a synthetic `_key` marker carries the key signature per line so a
+  mid-tune key change still resolves.
+- `buildTrack` keys `c` by the `n` array contents, so identical bars (which
+  repeats produce by construction) share one entry and `p` re-references it.
+- `V: transpose=` (from `staff.clef.transpose`), `%%MIDI transpose` (tune-level
+  in `formatting.midi.transpose`, or a per-voice `cmd:"transpose"` item) add a
+  semitone shift to melodic notes. Drums ignore it.
+
 ## Still open
 
-- Repeats / endings: `|: :|` and `|1 |2` are not yet expanded into the `p`
-  sequence — a repeated section currently plays once.
-- Instrument patches are unrefined first-pass guesses (see Step 1).
-- `%%MIDI transpose` / `V: transpose=` not handled.
+- Instrument patches are unrefined first-pass guesses (see Step 1). Plan: fit
+  them against soundfont-rendered references in a separate tool; drop in the
+  SoundBox editor's ~25 real presets as the fallback meanwhile.
+- Anacrusis / pickup bars: a partial first bar shifts every later bar off the
+  pattern grid (pre-existing).
+- Nested and >2x repeats are approximate.
